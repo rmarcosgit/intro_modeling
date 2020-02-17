@@ -1,0 +1,456 @@
+---
+title: "Spatial-temporal modeling of environmental processes"
+author: 
+  - "Marcos Rodrigues"
+date: "17/02/2020, 18/02/2020, 24/02/2020"
+bibliography: resources/biblio.bib
+output: rmdformats::readthedown 
+number_sections: true
+---
+
+```{r setup, echo=FALSE, message=FALSE,warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(factoextra)
+library(NbClust)
+library(fmsb)
+library(sf)
+library(ggplot2)
+library(forcats)
+library(scales)
+library(trend)
+
+```
+#Modeling fire regime dynamics at mainland Spain
+
+> Fire regime is defined as the average behavior of a set of key features, the remains stable over space and time [@RODRIGUES2019135841]
+
+### What are we going to do?
+
+![](resources/images/fire_regime_model.png)
+
+### Our data
+
+```{r, echo=FALSE}
+
+#READING AND PREPARING DATA
+fires <- read.csv2('data/fires.csv')
+grid <- sf::read_sf('data/Fires_grid_CCAA.shp',quiet = F)
+variables <- read.csv2('data/variables.csv')
+
+str(fires)
+str(grid)
+str(variables)
+```
+
+
+## Time series analysis
+
+As a preliminary step towards fire regime modeling we must ascertain whether fire regime features (number of fires, burneda area, large fires, cause or seasonality) vary over time.
+
+Time series analysis comprises a wide array of tools to investigate temporal changes. In this workshop we will keep it simple, limiting the analysis the identification of temporal trends on a yearly basis. First, let's plot the temporal evolution of the most representative fire regime features, i.e., number of fires and burned area:
+
+```{r}
+fires.year <- fires %>%
+  filter(YEAR>1974) %>%
+  group_by(YEAR) %>%
+  summarise(N=n(),BA=sum(BAREA))
+  
+ggplot(data=fires.year) +
+    geom_bar(aes(x=YEAR,y=BA/50),
+           stat = 'identity',fill='red') +
+  geom_line(aes(x=YEAR,y=N),color = 'blue') +
+  scale_y_continuous(sec.axis = sec_axis(~.*50, name = "Burned area (ha)")) +
+  # scale_colour_manual(values = c("red", "blue")) +
+  geom_vline(xintercept = 1994,lty=2)+
+  labs(y = "Number of fires",
+       x = "",
+       colour = "") +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+```
+
+It seems that burned area decreased over time. Let's check if the evolution that we can perceive by visual inspection it's actually true (that means statistically significant). We are going apply the Mann-Kendall test [@Kendall1975] to investigate the existence of trends and, in case there's any actual trend, we will check when is the major breakpoint in the time series using the Pettit test [@Pettitt1979]:
+
+```{r}
+mk.test(fires.year$N)
+mk.test(fires.year$BA)
+pettitt.test(fires.year$BA) 
+```
+
+According to the Mann-Kendall test there is a significant trend in burned area (p<0.05). The Pettit test identified two possible breakpoints at position 17 (1991) and 20 (1994). That implies we cannot model fire regime using the entire period but must split the time series at least into two subsamples. We are going to take the year 1994 as main change point [@Jimenez-Ruano2017] and analyze the periods 1974-1994 and 1995-2015, separately.
+
+First things first, we need to build our fire features, We will follow the suggest varibles in @RODRIGUES2019135841 and create the following features:
+
+- Number of fires
+- Burned area
+- Burned area by large fires (>100 hectares)
+- Burned area by natural fires (CAUSA 1)
+- Number of fires during spring-winter (October, November, December, February, March and April)
+
+```{r}
+features_1 <- fires %>%
+  filter(YEAR>1994,BAREA>1) %>%
+  group_by(CODCUAD, YEAR,.drop = F) %>%
+  summarise(N = n(),BA = sum(BAREA)) %>%
+  group_by(CODCUAD,.drop = F) %>%
+  summarise(N = mean(N),BA = mean(BA))
+
+features_2 <- fires %>%
+  filter(YEAR>1994,BAREA>1) %>%
+  filter(CAUSA == 1) %>%
+  group_by(CODCUAD, YEAR, MONTH, .drop = F) %>%
+  summarise(NL= n(),BAL=sum(BAREA))%>%
+  group_by(CODCUAD,.drop = F) %>%
+  summarise(BAL = mean(BAL))
+
+features_3 <- fires %>%
+  filter(YEAR>1994,BAREA>1) %>%
+  filter(BAREA>100) %>%
+  group_by(CODCUAD,YEAR,MONTH,.drop = F) %>%
+  summarise(BA100 = mean(BAREA))%>%
+  group_by(CODCUAD,.drop = F) %>%
+  summarise(BA100 = mean(BA100))
+
+features_4 <- fires %>%
+  filter(YEAR>1994,BAREA>1) %>%
+  filter(MONTH < 5 | MONTH>9) %>%
+  group_by(CODCUAD, YEAR,.drop = F) %>%
+  summarise(NW=n())%>%
+  group_by(CODCUAD,.drop = F) %>%
+  summarise(NW = mean(NW))
+
+features.present <- left_join(features_1,features_2,by='CODCUAD') %>%
+  left_join(features_3,by='CODCUAD') %>%
+  left_join(features_4,by='CODCUAD') 
+
+features.present[is.na(features.present)] <- 0
+
+```
+
+## Identify fire regime typologies
+
+The first step involves the identification and characterization of fire regimes. To do so, we will leverage `clustering` techniques. 
+
+> Cluster analysis allows grouping  a set of objects in such a way that objects in the same group (called a cluster) are more similar to each other than to those in other groups (clusters). [Wikipedia.org](https://en.wikipedia.org/wiki/Cluster_analysis)
+
+As a preliminary step, we will apply Principal Component Analysis (PCA). Although not mandatory, PCA enhances the separabilty of objects will reducing the amount of information (dimensions) to perform the cluster analysis. Furthermore, PCA is also a useful exploratory technique that will grant us a better understanding of our dataset.
+
+Note that we enabled the `scale` and `center` options to rescales the original data, centering them to mean 0, and standartizing them as the ratio of the standard deviation.
+
+```{r}
+pca <- prcomp(features.present[,2:6],scale=T,center = T)
+summary(pca)
+pca$rotation
+
+cluster.data <- pca$x[,1:3]
+```
+
+PCA's outputs suggest keeping the first 3 components, gathering up to 93.(%) of the variance. These components may be interpreted as follows:
+
+- PC1 (41.2%): High fire activity, mostly linked to non-natural fires.
+- PC2 (34.6%): Large fire frequency during winter.
+- PC3 (18.0%): Small natural fires.
+
+Once, key components are identify we submit them to cluster analysis. There is a wide range of clustering approaches. In this example we used the `nbClust` package. It appies hierarchical clustering, offering several dissimilarty measures and grouping strategies. It also provides a way to optimize the number of clusters to be fitted.
+
+```{r}
+#Cluster parameters
+d <- "canberra" 
+m <- "ward.D2"
+index <- "silhouette"
+
+#Optimizing cluster model
+cluster.present <- NbClust(cluster.data,index= index, distance = d, 
+                    min.nc = 3,
+                    max.nc = 3, method = m)
+
+features.present$Cluster <- cluster.present$Best.partition
+grid.present <- left_join(grid,features.present,
+                          by=c('Cod_Cuad' ='CODCUAD'))
+
+map.present <- ggplot(grid.present,aes(fill=factor(Cluster))) +
+  geom_sf(color=NA) +
+  theme_bw()
+
+map.present
+```
+
+To keep it simple, we forced the algorithm to fit 3 clusters. As you may know, clustering is a type of unsupervised learning technique. That implyis we do not know the patterns data follows. Thus it is of critical importance to carefully examine the results to understand them and see if they are meaningul enough.
+
+```{r}
+features.cluster <- features.present %>%
+  na.omit() %>%
+  group_by(Cluster) %>%
+  # summarise_at(vars(N:NW),mean) %>%
+  mutate_at(vars(N:NW),log) %>%
+  # summarise_at(vars(N:NW),mean) %>%
+  gather('vars','values',2:6)
+
+features.cluster$vars <- fct_relevel(as.factor(features.cluster$vars),'N','BA','BA100','BAL','NW')
+
+ggplot(features.cluster,aes(x=factor(Cluster),y=values,fill=vars)) +
+  geom_boxplot(outlier.shape = NA) +
+  # geom_bar(stat = 'identity') +
+  facet_wrap(~vars, scales = 'free_y') +
+  theme_bw()
+```
+
+After checking the distribution of fire features among the 3 clusters (further referred to as fire regimes) we can label them as follows:
+
+- Regime 1: high fire activity. This group gathers the most hazardous situations: high number of fires and burned area, large fires and fire activity outside summer. Low incidence of natural fires.
+
+- Regime 2: Small human-related fires.
+
+- Regime 3: Intermediate sized fires. Unfrequent fires but with relatively large burned area, associated to natural fires.
+
+This is a very shallow description but already meaningul. To facilitate the next steps, we can relabel the groups in increasing order of hazardouseness (3 most threatening situation, 1 low activity). Thus, regime 1 will be tagged as 3, regime 3 as 2 and regime 2 as 1.
+
+```{r}
+features.present$Cluster <- recode(as.character(features.present$Cluster),
+                                   '1' = '3', '2' ='1', '3' = '2' )
+
+grid.present <- left_join(grid,features.present,
+                          by=c('Cod_Cuad' ='CODCUAD'))
+
+map.present <- ggplot(na.omit(grid.present),aes(fill=factor(Cluster))) +
+  geom_sf(color=NA) +
+  scale_fill_manual(name = '',
+                    values = c('1' = '#45b39d','2'='#f9e79f','3'='#cd6155')) +
+  theme_bw()
+
+map.present
+```
+
+## Transferring fire regimes into the past
+
+We already identified and characterized fire regimes during the present period (1995-2015) but, in order to explore fire regime dynamics with must know the starting point. That is, how were our fire regimes distributed during the past (1974-1994).
+
+To solve this problem we can take advantage of `classification` modeling. In this ocasion, we are facing a supervised learning technique because what we want to do is use the information about current clusters, including cluster labels, to classify past fire events according to the observed typologies in the present. So, in this case we already know to what regime belongs each cell in the grid, and also the values of each fire feature.
+
+We just need to replicate our fire features under past conditions and then apply a classification technique to transfer our typologies.
+
+```{r}
+features_1 <- fires %>%
+  filter(YEAR < 1994, BAREA > 1) %>%
+  group_by(CODCUAD, YEAR, .drop = F) %>%
+  summarise(N = n(), BA = sum(BAREA)) %>%
+  group_by(CODCUAD, .drop = F) %>%
+  summarise(N = mean(N), BA = mean(BA))
+
+features_2 <- fires %>%
+  filter(YEAR < 1994, BAREA > 1) %>%
+  filter(CAUSA == 1) %>%
+  group_by(CODCUAD, YEAR, MONTH, .drop = F) %>%
+  summarise(NL = n(), BAL = sum(BAREA)) %>%
+  group_by(CODCUAD, .drop = F) %>%
+  summarise(BAL = mean(BAL))
+
+features_3 <- fires %>%
+  filter(YEAR < 1994, BAREA > 1) %>%
+  filter(BAREA > 100) %>%
+  group_by(CODCUAD, YEAR, MONTH, .drop = F) %>%
+  summarise(BA100 = mean(BAREA)) %>%
+  group_by(CODCUAD, .drop = F) %>%
+  summarise(BA100 = mean(BA100))
+
+features_4 <- fires %>%
+  filter(YEAR < 1994, BAREA > 1) %>%
+  filter(MONTH < 5 | MONTH > 9) %>%
+  group_by(CODCUAD, YEAR, .drop = F) %>%
+  summarise(NW = n()) %>%
+  group_by(CODCUAD, .drop = F) %>%
+  summarise(NW = mean(NW))
+
+features.past <-
+  left_join(features_1, features_2, by = 'CODCUAD') %>%
+  left_join(features_3, by = 'CODCUAD') %>%
+  left_join(features_4, by = 'CODCUAD')
+
+features.past[is.na(features.past)] <- 0  
+    
+```
+
+This sets it up in terms of fire features. Now, how do we conduct the classification procedure. Same as in the clustering problem, we have many alternatives when it comes to classification. For instance, we may apply `Random Forest`, an algorithm that we'll explore later on. In this case, one technique that really suits the purpose is  the `K-Nearest Neighbor` (KNN) algorithm beacuse it uses dissimilarity measures (same as clustering does) to classify each observation into its more convenient group.
+
+```{r}
+library(knnGarden)
+library(class)
+    
+# knn.past <- knnVCN(TrnX = features.present[,2:6],
+#                 OrigTrnG = features.present$Cluster,
+#                 TstX = features.past[,2:6],
+#                 ShowObs=FALSE,K=1,method="canberra",p = 2)
+
+knn.past <- knn(train = features.present[,2:6], 
+                test = features.past[,2:6],
+                cl = features.present$Cluster, k=5)
+
+features.past$Cluster <- knn.past
+grid.past <- left_join(grid,features.past,
+                          by=c('Cod_Cuad' ='CODCUAD'))
+
+map.past <- ggplot(na.omit(grid.past),aes(fill=factor(Cluster))) +
+  geom_sf(color=NA) +
+  scale_fill_manual(name = '',
+                    values = c('1' = '#45b39d','2'='#f9e79f','3'='#cd6155')) +
+  theme_bw()
+
+map.past
+```
+
+It must be noted that we applied the *regular* version of KNN, which is based on euclidan distance. However, since we used `canberra` distance as our dissimilarity measure when fitting the cluster, the ideal would be using the same distance approach. In the previous chunck of code you can find the `knnVCN` alternative that has been discarded since it takes a very long time to run.
+
+That being said, we still have to do something. Classification is a supervised learning technique, so we must assess its performance in some way to determine to which extent its outputs may be trusted. Fortunately for us, the `knn.cv` function allows to conduct a Leave-One-Out Cross-Validation (LOOCV) procedure without requiring us to code it on our own.
+
+```{r}
+cv <-knn.cv(train = features.present[,2:6],k = 5,
+       cl = features.present$Cluster)
+
+caret::confusionMatrix(as.factor(cv),as.factor(features.present$Cluster))
+
+```
+
+We are almost done. Let's take a look into the transition matrix, i.e., a table summarazing the combinations of fire regimes from the past towards present.
+
+```{r}
+tm <- as.data.frame(table(past = features.past$Cluster,
+      present = features.present$Cluster))
+
+ggplot(tm, aes(x=as.numeric(present),y=as.numeric(past),fill=Freq)) +
+  geom_tile(color='white') +
+  scale_fill_viridis_c(option = 'D') +
+  scale_y_reverse(name='Past') +
+  scale_x_continuous(name = 'Present', position = "top") +
+  geom_text(aes(label=Freq),color='white') +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+Finally, let's go and compare the spatial distribution of past and current regimes:
+
+```{r}
+library(ggpubr)
+ggarrange(map.past, map.present,
+          labels = c("Past", "Current"),
+          ncol = 2)
+```
+
+Both the transition matrix and the map comparison highlight the main transition as a downgrade in fire activity, with mostly declining trajectories (from 3 to 1, from 2 to 1), though progressive transitions were also found.
+
+## Which factors drove the change in fire regime?
+
+This will be our last analysis. It aims at identifying under which circumstances the change of fire regime is triggered or what conditions favor the persistence of a given fire regime type.
+
+We will apply regression models to fullfil the taks. We will compare two techniques allowing for binary regression (change vs no change in fire regime) to determine the chances of change happening. First, we will fit a `logit regression` model. Then we will train a `Random Forest` model. Both models will be evaluated in terms of performance. The one that work best will be subsequently explored in terms of variable performance and explanatory sense.
+
+First, we will read a table with our explanatory variables, and merge the information about fire regime transition:
+
+```{r}
+clusters <- cbind(features.past[,c(1,7)],features.present[,7])
+names(clusters)[2:3] <- c('Past','Present')
+clusters$Change <- paste(clusters$Past,clusters$Present,sep = '-')
+
+data.regresion <- left_join(variables,clusters,by=c('Cod_Cuad' = 'CODCUAD'))
+```
+
+Our variables are as follows:
+
+- wai90: wildland-agricultural interface. Use of fire as a tool to cleanse plots or remove residues.
+- wui90: wildland-urban interface. Increases pressure on wildlands and forests.
+- dempot: increase in population density.
+- temp: trend in temperature.
+- prec: trend in annual rainfall.
+- elev: elevation in meters above the sea level.
+- slope: inclination of the relief.
+- roads: length of the road network. Increased accessibility.
+
+Now, let's build our dependent variable, i.e., change (1) and no change (0) of fire regime. We will focus on an increasing transition, from intermediate fire incidence (regime 2) to hazardous conditions (regime 3). So, let's extract the subset of observation that meet the criteria and recode them into a binary variable (1-0):
+
+```{r}
+data.model <- filter(data.regresion,Change=='2-3' | Change=='2-2')
+data.model <- mutate(data.model,Change = ifelse(Change=='2-3',1,0))
+
+```
+
+Logistic regression models require our data to be linearly independent, that means that explanatory variables must be uncorrelated among them. A correlogram will assist us un such task:
+
+```{r}
+library(corrplot)
+
+M<-cor(data.model[,-c(1,12:14)])
+sig <- cor.mtest(data.model[,-c(1,12:14)], conf.level = .95)
+
+```
+
+Aparently all variables are good to go. Now let's split our data into training and testing samples:
+
+```{r}
+set.seed(100)
+training.rows <- sample(row(data.model),floor(nrow(data.model)*0.7))
+data.train <- data.model[training.rows,]
+data.test <- data.model[-training.rows,]
+```
+
+Let's fit and inspect the logit model:
+
+```{r}
+model.logit  <- glm(Change~wuiCh+elev+slope+dempot+temp+prec+roads,
+                    data=data.train,
+                    family = binomial())
+
+summary(model.logit)
+```
+
+Now we check its performance:
+
+```{r}
+library(dismo)
+
+eval.logit<-evaluate(p=data.test[data.test$Change==1,],
+                     a=data.test[data.test$Change==0,],
+                     model=model.logit)
+
+par(mfrow=c(1,3))
+plot(eval.logit,'ROC')
+boxplot(eval.logit, col = c('#45b39d', '#cd6155'))
+density(eval.logit)
+```
+
+And we do the same but using Random Forest:
+
+```{r}
+library(randomForest)
+
+model.rf  <- randomForest(Change~wai90+elev+slope+dempot+prec+roads,
+                    data=data.train)
+
+model.rf
+
+# Model evaluation with test sample
+eval.rf<-evaluate(p=data.test[data.test$Change==1,],
+                     a=data.test[data.test$Change==0,],
+                     model=model.rf)
+
+par(mfrow=c(1,3))
+plot(eval.rf,'ROC')
+boxplot(eval.rf, col = c('#45b39d', '#cd6155'))
+density(eval.rf)
+```
+
+Since Random Forest seems to outperform logit regression we will take a look at the performane and explanatory sense of the predictors:
+
+```{r}
+
+varImpPlot(model.rf)
+```
+
+```{r}
+library(plotmo)
+plotmo(model.rf)
+```
+
+
+
+# References
